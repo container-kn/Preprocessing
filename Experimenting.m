@@ -1,9 +1,11 @@
 classdef Experimenting < handle
     % Experimenting - Orchestration engine for ASR benchmarking.
-    %   Manages data flow between raw EEG datasets and the four ASR variants
-    %   (originalASR, vanillaASR, emaASR, graphASR). Partitions data into
-    %   functional segments (Calibration, Closed-Eyes, Open-Eyes) and captures
-    %   telemetry via a shared timeProbe and per-variant diagnostic probes.
+    %   Manages data flow between raw EEG datasets and the following ASR variants:
+    %     originalASR, vanillaASR, hmoASR, hebbASR, emaASR, embeddedASR,
+    %     riemannASR, graphASR.
+    %   Partitions data into functional segments (Calibration, Closed-Eyes,
+    %   Open-Eyes) and captures telemetry via a shared timeProbe and per-variant
+    %   diagnostic probes.
 
     properties (Access = public)
         config          % config_experiment object containing paths and params
@@ -123,7 +125,10 @@ classdef Experimenting < handle
                     obj.asr = vanillaASR(calEEG, fs, params.cutoff, params.blocksize, tp);
 
                 case {'hmo_asr', 'hmo-asr'}
-                    obj.asr = hmoASR_working(fs, params);
+                    obj.asr = hmoASR(fs, params, tp);
+
+                case {'hebb_asr', 'hebb-asr'}
+                    obj.asr = hebbASR(fs, params, tp);
 
                 case {'ema_asr', 'ema-asr'}
                     % FIX #4: pass shared tp as third argument

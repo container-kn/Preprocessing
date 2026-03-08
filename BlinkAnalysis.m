@@ -76,6 +76,10 @@ classdef BlinkAnalysis < handle
         algorithmName
         nCombos
         results
+
+        % Optional streaming loader — set by ExperimentAnalysis for split-file layout.
+        loaderFcn   = []   % @(k) ana.loadCombo(k)
+        unloaderFcn = []   % @(k) ana.unloadCombo(k)
     end
 
     % ================================================================
@@ -172,6 +176,11 @@ classdef BlinkAnalysis < handle
             tolSamples = round(toleranceSec * obj.fs);
 
             for c = 1:obj.nCombos
+
+                % Stream combo on demand if a loader is wired up
+                if ~isempty(obj.loaderFcn)
+                    obj.loaderFcn(c);
+                end
 
                 cleanClosed = obj.subject_results(c).cleanClosed;
                 cleanOpen   = obj.subject_results(c).cleanOpen;
@@ -274,6 +283,11 @@ classdef BlinkAnalysis < handle
                 obj.results(c).perChannel = perCh;
                 obj.results(c).summary    = summary;
                 obj.results(c).method     = method;
+
+                % Free combo signals if a loader is managing memory
+                if ~isempty(obj.unloaderFcn)
+                    obj.unloaderFcn(c);
+                end
             end
 
             fprintf('  Done.\n');
@@ -344,6 +358,17 @@ classdef BlinkAnalysis < handle
             nCh  = size(XRaw, 1);
             mpdR = round(minDistRaw   * fs);
             mpdC = round(minDistClean * fs);
+
+            % Guard: XClean must have the same channel count as XRaw.
+            % An empty or mismatched XClean means signals were not loaded —
+            % return zero counts so the caller can still proceed.
+            if isempty(XClean) || size(XClean, 1) ~= nCh
+                idx_raw   = cell(nCh, 1);
+                idx_clean = cell(nCh, 1);
+                n_raw     = zeros(nCh, 1);
+                n_clean   = zeros(nCh, 1);
+                return;
+            end
 
             idx_raw   = cell(nCh, 1);
             idx_clean = cell(nCh, 1);

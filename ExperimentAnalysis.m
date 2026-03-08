@@ -51,9 +51,13 @@ classdef ExperimentAnalysis < handle
         % ---- Analyser instances (populated by compute* methods) ----
         blink             % BlinkAnalysis instance
         signalStats       % SignalStatistics instance
+        spectral          % SpectralAnalysis instance
+        quietRegion       % QuietRegionAnalysis instance
+        temporal          % TemporalAnalysis instance
         ica               % ICAAnalysis instance
-        % bandPower       % BandPowerAnalysis instance  (future)
-        % snr             % SNRAnalysis instance        (future)
+
+        % ---- Streaming state (populated by loadMeta) ----
+        paramsList        % 1×nCombos cell array of param structs (no signal data)
     end
 
     properties (Access = private)
@@ -104,6 +108,8 @@ classdef ExperimentAnalysis < handle
             obj.blink = BlinkAnalysis( ...
                 obj.raw, obj.subject_results, obj.fs, ...
                 obj.subjectID, obj.algorithmName);
+            obj.blink.loaderFcn   = @(k) obj.loadCombo(k);
+            obj.blink.unloaderFcn = @(k) obj.unloadCombo(k);
             obj.blink.compute(varargin{:});
         end
 
@@ -120,6 +126,8 @@ classdef ExperimentAnalysis < handle
             obj.signalStats = SignalStatistics( ...
                 obj.raw, obj.subject_results, obj.fs, ...
                 obj.subjectID, obj.algorithmName);
+            obj.signalStats.loaderFcn   = @(k) obj.loadCombo(k);
+            obj.signalStats.unloaderFcn = @(k) obj.unloadCombo(k);
             obj.signalStats.compute();
         end
 
@@ -174,11 +182,251 @@ classdef ExperimentAnalysis < handle
             obj.ica.compute(fwd{:});
         end
 
+        % ================================================================
+        % computeSpectral — delegates to SpectralAnalysis
+        % ================================================================
+        function computeSpectral(obj, varargin)
+            % COMPUTESPECTRAL - Instantiate SpectralAnalysis and run.
+            %
+            %   All name-value options forwarded to SpectralAnalysis.compute():
+            %     'welchWinSec'    scalar > 0   Welch window length (sec)
+            %                                   [] = MATLAB default  (default [])
+            %     'welchOverlap'   0 ≤ x < 1    Overlap fraction
+            %                                   [] = MATLAB default 50%  (default [])
+            %     'freqResolution' scalar > 0   Freq-axis step Hz   (default 0.5)
+            %
+            %   Example:
+            %     ana.computeSpectral();
+            %     ana.computeSpectral('welchWinSec', 2, 'welchOverlap', 0.5);
+            %     ana.spectral.getSummary('alpha.totalPowerAfter', 'closed')
+            %     ana.spectral.plotPSD(1, 'closed')
+            %     T = ana.spectral.paramTable();
 
-        function vals = getSummary(obj, metricName, fieldName)
+            obj.checkLoaded();
+            obj.spectral = SpectralAnalysis( ...
+                obj.raw, obj.subject_results, obj.fs, ...
+                obj.subjectID, obj.algorithmName);
+            obj.spectral.loaderFcn   = @(k) obj.loadCombo(k);
+            obj.spectral.unloaderFcn = @(k) obj.unloadCombo(k);
+            obj.spectral.compute(varargin{:});
+        end
+
+        % ================================================================
+        % computeQuietRegion — delegates to QuietRegionAnalysis
+        % ================================================================
+        function computeQuietRegion(obj, varargin)
+            % COMPUTEQUIETREGION - Instantiate QuietRegionAnalysis and run.
+            %   Requires computeBlinks() to have been called first.
+            %
+            %   All name-value options forwarded to QuietRegionAnalysis.compute():
+            %     'quietWinSec'      scalar   Exclusion half-window around blinks (sec)
+            %                                 default 0.25
+            %     'maxDelaySec'      scalar   finddelay search range (sec)
+            %                                 default 0.25
+            %     'minQuietSamples'  scalar   Skip channel if fewer quiet samples
+            %                                 default 50
+            %
+            %   Example:
+            %     ana.computeBlinks();
+            %     ana.computeQuietRegion();
+            %     ana.computeQuietRegion('quietWinSec', 0.5);
+            %     ana.quietRegion.getSummary('corr_median',   'closed')
+            %     ana.quietRegion.getSummary('rre_median',    'closed')
+            %     T = ana.quietRegion.paramTable();
+
+            obj.checkLoaded();
+            if isempty(obj.blink)
+                error('ExperimentAnalysis:blinkRequired', ...
+                    ['computeQuietRegion() requires blink data. ' ...
+                     'Call computeBlinks() first.']);
+            end
+            obj.quietRegion = QuietRegionAnalysis( ...
+                obj.raw, obj.subject_results, obj.fs, obj.blink, ...
+                obj.subjectID, obj.algorithmName);
+            obj.quietRegion.loaderFcn   = @(k) obj.loadCombo(k);
+            obj.quietRegion.unloaderFcn = @(k) obj.unloadCombo(k);
+            obj.quietRegion.compute(varargin{:});
+        end
+
+        % ================================================================
+        % computeTemporal — delegates to TemporalAnalysis
+        % ================================================================
+        function computeTemporal(obj, varargin)
+            % COMPUTETEMPORAL - Instantiate TemporalAnalysis and run.
+            %
+            %   All name-value options forwarded to TemporalAnalysis.compute():
+            %     'windowSec'        scalar > 0  Window length (sec)      default 2
+            %     'hopSec'           scalar > 0  Hop size (sec)           default 1
+            %     'overlap'          0 ≤ x < 1   Overlap fraction         (overrides hopSec)
+            %     'subspaceRank'     scalar       Top-k eigenvectors       default min(10,nCh)
+            %     'channels'         vector       Channel subset           default all
+            %     'compactionThresh' 0–1          Energy compaction target default 0.9
+            %     'kRef'             scalar       Reference subspace rank  default subspaceRank
+            %     'useRobustCov'     logical      Use block_geometric_median default true
+            %     'blockSize'        scalar       Block size for robust cov  default 10
+            %
+            %   Example:
+            %     ana.computeTemporal();
+            %     ana.computeTemporal('windowSec', 2, 'overlap', 0.5, 'subspaceRank', 10);
+            %     ana.temporal.getSummary('signal.rrmse_mean',        'closed')
+            %     ana.temporal.getSummary('subspace.angle_mean_mean', 'closed')
+            %     ana.temporal.plotTimeSeries(1, 'signal.rrmse', 'closed')
+            %     T = ana.temporal.paramTable();
+
+            obj.checkLoaded();
+            obj.temporal = TemporalAnalysis( ...
+                obj.raw, obj.subject_results, obj.fs, ...
+                obj.subjectID, obj.algorithmName);
+            obj.temporal.loaderFcn   = @(k) obj.loadCombo(k);
+            obj.temporal.unloaderFcn = @(k) obj.unloadCombo(k);
+            obj.temporal.compute(varargin{:});
+        end
+
+
+        % ================================================================
+        % loadMeta — load raw signals + meta only (no combo data)
+        % ================================================================
+        function loadMeta(obj)
+            % LOADMETA - Load raw signals and combo count/params without
+            %   loading any cleaned signal data. Used for streaming workflows
+            %   where combos are processed one at a time via loadCombo(k).
+            %
+            %   After loadMeta():
+            %     obj.raw        -- populated
+            %     obj.nCombos    -- populated
+            %     obj.paramsList -- populated (cell array of param structs)
+            %     obj.subject_results -- empty (not loaded yet)
+            %
+            %   Example:
+            %     ana = ExperimentAnalysis(accumulatedDir, 'graph-asr', 6, 500);
+            %     ana.loadMeta();
+            %     for k = 1:ana.nCombos
+            %         ana.loadCombo(k);
+            %         ana.computeBlinks();
+            %         % ...
+            %     end
+
+            rawFname  = sprintf('S%d_%s_raw.mat',  obj.subjectID, obj.algorithmName);
+            metaFname = sprintf('S%d_%s_meta.mat', obj.subjectID, obj.algorithmName);
+            rawFpath  = fullfile(obj.accumulatedFolder, rawFname);
+            metaFpath = fullfile(obj.accumulatedFolder, metaFname);
+
+            if ~isfile(rawFpath) || ~isfile(metaFpath)
+                error('ExperimentAnalysis:noSplitLayout', ...
+                    ['loadMeta() requires split layout files.\n' ...
+                     'Expected:\n  %s\n  %s\n' ...
+                     'Use load() for monolithic files.'], rawFpath, metaFpath);
+            end
+
+            loadedRaw      = load(rawFpath, 'raw');
+            obj.raw        = loadedRaw.raw;
+
+            loadedMeta     = load(metaFpath, 'nCombos', 'paramsList');
+            obj.nCombos    = loadedMeta.nCombos;
+            obj.paramsList = loadedMeta.paramsList;
+
+            % Build a lightweight subject_results stub — params only, no signals.
+            % This lets paramTable() and identity columns work before any combo loads.
+            comboFields = {'parameters','timestamp', ...
+                           'cleanCalibration','cleanClosed','cleanOpen', ...
+                           'modifiedMask','timeProbe','probeRaw','probeClean'};
+            prototype          = cell2struct(repmat({[]}, numel(comboFields), 1), comboFields);
+            obj.subject_results = repmat(prototype, 1, obj.nCombos);
+            for k = 1:obj.nCombos
+                obj.subject_results(k).parameters = obj.paramsList{k};
+            end
+
+            fprintf('loadMeta: S%d %s -- %d combos ready for streaming.\n', ...
+                obj.subjectID, obj.algorithmName, obj.nCombos);
+        end
+
+        % ================================================================
+        % loadCombo — load one combo's cleaned signals into subject_results(k)
+        % ================================================================
+        function loadCombo(obj, k)
+            % LOADCOMBO - Stream one combo file into subject_results(k).
+            %   Replaces whatever was previously in subject_results(k).
+            %   All other combos remain as they were (stub or previously loaded).
+            %
+            %   Requires loadMeta() to have been called first.
+            %
+            %   Inputs:
+            %     k : combo index (1-based, 1 <= k <= obj.nCombos)
+            %
+            %   Example:
+            %     ana.loadMeta();
+            %     ana.loadCombo(3);
+            %     % now only combo 3 has real signal data
+
+            if isempty(obj.nCombos) || obj.nCombos == 0
+                error('ExperimentAnalysis:notLoaded', ...
+                    'Call loadMeta() before loadCombo().');
+            end
+            if k < 1 || k > obj.nCombos
+                error('ExperimentAnalysis:outOfRange', ...
+                    'k=%d out of range [1, %d].', k, obj.nCombos);
+            end
+
+            comboFname = sprintf('S%d_%s_combo_%d.mat', ...
+                obj.subjectID, obj.algorithmName, k);
+            comboFpath = fullfile(obj.accumulatedFolder, comboFname);
+
+            if ~isfile(comboFpath)
+                error('ExperimentAnalysis:comboNotFound', ...
+                    'Combo file missing: %s', comboFpath);
+            end
+
+            loadedCombo = load(comboFpath, 'combo');
+            c           = loadedCombo.combo;
+
+            comboFields = {'parameters','timestamp', ...
+                           'cleanCalibration','cleanClosed','cleanOpen', ...
+                           'modifiedMask','timeProbe','probeRaw','probeClean'};
+            for f = 1:numel(comboFields)
+                fld = comboFields{f};
+                if isfield(c, fld)
+                    obj.subject_results(k).(fld) = c.(fld);
+                end
+            end
+        end
+
+        % ================================================================
+        % unloadCombo — free signal data for combo k to recover memory
+        % ================================================================
+        function unloadCombo(obj, k)
+            % UNLOADCOMBO - Clear cleaned signal data for combo k.
+            %   Parameters stub is preserved so getSummary() identity columns work.
+            %   Call after saving results for k to free memory before loading k+1.
+
+            if k < 1 || k > obj.nCombos, return; end
+            obj.subject_results(k).cleanCalibration = [];
+            obj.subject_results(k).cleanClosed      = [];
+            obj.subject_results(k).cleanOpen        = [];
+            obj.subject_results(k).modifiedMask     = [];
+            obj.subject_results(k).timeProbe        = [];
+            obj.subject_results(k).probeRaw         = [];
+            obj.subject_results(k).probeClean       = [];
+        end
+
+
+        function vals = getSummary(obj, metricName, fieldName, segment)
             % GETSUMMARY - Pull one scalar summary field across all combos.
-            %   metricName : analyser name, e.g. 'blink'
-            %   fieldName  : field in .summary, e.g. 'blinkReductionRatio_closed'
+            %
+            %   metricName : analyser name
+            %                'blink' | 'signalStats' | 'spectral' |
+            %                'temporal' | 'quietRegion' | 'ica'
+            %   fieldName  : field path — format depends on analyser (see each class)
+            %   segment    : 'closed' | 'open' | 'all'  (required for spectral,
+            %                temporal, quietRegion; ignored for blink, ica)
+            %
+            %   Examples:
+            %     ana.getSummary('blink',       'blinkReductionRatio_closed')
+            %     ana.getSummary('spectral',    'alpha.totalPowerAfter',    'closed')
+            %     ana.getSummary('temporal',    'signal.rrmse_mean',        'closed')
+            %     ana.getSummary('quietRegion', 'corr_median',              'closed')
+
+            if nargin < 4, segment = 'closed'; end
+
             switch metricName
                 case 'blink'
                     if isempty(obj.blink)
@@ -209,6 +457,24 @@ classdef ExperimentAnalysis < handle
                             vals(c) = r.(parts{1}).(parts{2}).(parts{3});
                         end
                     end
+                case 'spectral'
+                    if isempty(obj.spectral)
+                        error('ExperimentAnalysis:notComputed', ...
+                            'Call computeSpectral() first.');
+                    end
+                    vals = obj.spectral.getSummary(fieldName, segment);
+                case 'temporal'
+                    if isempty(obj.temporal)
+                        error('ExperimentAnalysis:notComputed', ...
+                            'Call computeTemporal() first.');
+                    end
+                    vals = obj.temporal.getSummary(fieldName, segment);
+                case 'quietRegion'
+                    if isempty(obj.quietRegion)
+                        error('ExperimentAnalysis:notComputed', ...
+                            'Call computeQuietRegion() first.');
+                    end
+                    vals = obj.quietRegion.getSummary(fieldName, segment);
                 otherwise
                     error('ExperimentAnalysis:unknownMetric', ...
                         'Unknown metric "%s". Run the corresponding compute* method first.', ...
@@ -338,17 +604,109 @@ classdef ExperimentAnalysis < handle
     methods (Access = private)
 
         function loadAccumulated(obj)
+            % LOADACCUMULATED - Load sweep data from disk.
+            %   Auto-detects split layout (_raw.mat + _meta.mat + _combo_k.mat)
+            %   or falls back to the legacy monolithic _accumulated.mat.
+            %
+            %   Split layout (preferred):
+            %     Reads raw and meta eagerly; assembles subject_results by
+            %     streaming each _combo_k.mat in sequence. Memory footprint is
+            %     identical to monolithic once all combos are loaded, but the
+            %     files on disk stay small enough to avoid the 12 GB ceiling.
+            %
+            %   Monolithic layout (legacy):
+            %     Loads raw + subject_results from a single _accumulated.mat.
+
+            rawFname  = sprintf('S%d_%s_raw.mat',  obj.subjectID, obj.algorithmName);
+            metaFname = sprintf('S%d_%s_meta.mat', obj.subjectID, obj.algorithmName);
+            rawFpath  = fullfile(obj.accumulatedFolder, rawFname);
+            metaFpath = fullfile(obj.accumulatedFolder, metaFname);
+
+            if isfile(rawFpath) && isfile(metaFpath)
+                % ── Split layout ──────────────────────────────────────
+                obj.loadSplit(rawFpath, metaFpath);
+            else
+                % ── Monolithic layout (legacy) ─────────────────────────
+                obj.loadMonolithic();
+            end
+        end
+
+        function loadSplit(obj, rawFpath, metaFpath)
+            % LOADSPLIT - Load split-layout files for this subject.
+            %   Reads _raw.mat and _meta.mat eagerly, then streams each
+            %   _combo_k.mat in sequence to assemble subject_results.
+            %
+            %   Combo files are expected at:
+            %     <accumulatedFolder>/S<id>_<algo>_combo_<k>.mat
+            %   Each contains a single variable 'combo' with fields:
+            %     parameters, timestamp, cleanCalibration, cleanClosed,
+            %     cleanOpen, modifiedMask, timeProbe, probeRaw, probeClean
+
+            % ── Raw signals ───────────────────────────────────────────
+            loadedRaw   = load(rawFpath, 'raw');
+            obj.raw     = loadedRaw.raw;
+
+            % ── Meta: nCombos + parameter list ────────────────────────
+            loadedMeta  = load(metaFpath, 'nCombos', 'paramsList');
+            nC          = loadedMeta.nCombos;
+
+            % ── Combos: stream each file ──────────────────────────────
+            comboFields = {'parameters','timestamp', ...
+                           'cleanCalibration','cleanClosed','cleanOpen', ...
+                           'modifiedMask','timeProbe','probeRaw','probeClean'};
+
+            % Pre-allocate struct array using the field list
+            prototype = cell2struct(repmat({[]}, numel(comboFields), 1), comboFields);
+            sr        = repmat(prototype, 1, nC);
+
+            for k = 1:nC
+                comboFname = sprintf('S%d_%s_combo_%d.mat', ...
+                    obj.subjectID, obj.algorithmName, k);
+                comboFpath = fullfile(obj.accumulatedFolder, comboFname);
+
+                if ~isfile(comboFpath)
+                    error('ExperimentAnalysis:comboNotFound', ...
+                        'Split combo file missing for S%d %s combo %d.\nExpected: %s', ...
+                        obj.subjectID, obj.algorithmName, k, comboFpath);
+                end
+
+                loadedCombo = load(comboFpath, 'combo');
+                c           = loadedCombo.combo;
+
+                for f = 1:numel(comboFields)
+                    fld = comboFields{f};
+                    if isfield(c, fld)
+                        sr(k).(fld) = c.(fld);
+                    end
+                end
+
+                fprintf('  combo %d/%d loaded.\n', k, nC);
+            end
+
+            obj.subject_results = sr;
+            obj.nCombos         = nC;
+            fprintf('Loaded (sweep/split) S%d %s -- %d combination(s).\n', ...
+                obj.subjectID, obj.algorithmName, nC);
+        end
+
+        function loadMonolithic(obj)
+            % LOADMONOLITHIC - Load legacy single _accumulated.mat file.
             fname = sprintf('S%d_%s_accumulated.mat', obj.subjectID, obj.algorithmName);
             fpath = fullfile(obj.accumulatedFolder, fname);
             if ~isfile(fpath)
                 error('ExperimentAnalysis:notFound', ...
-                    'Accumulated file not found: %s', fpath);
+                    ['No accumulated data found for S%d %s.\n' ...
+                     'Checked split : %s_raw.mat / _meta.mat\n' ...
+                     'Checked mono  : %s'], ...
+                    obj.subjectID, obj.algorithmName, ...
+                    sprintf('S%d_%s', obj.subjectID, obj.algorithmName), ...
+                    fpath);
             end
             loaded              = load(fpath, 'raw', 'subject_results');
             obj.raw             = loaded.raw;
             obj.subject_results = loaded.subject_results;
             obj.nCombos         = numel(obj.subject_results);
-            fprintf('Loaded (sweep) S%d %s -- %d combination(s).\n', ...
+            fprintf('Loaded (sweep/mono) S%d %s -- %d combination(s).\n', ...
                 obj.subjectID, obj.algorithmName, obj.nCombos);
         end
 

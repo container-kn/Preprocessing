@@ -61,6 +61,10 @@ classdef SignalStatistics < handle
         %                 .clean : stats on cleaned samples
         %   results(k).probe    : stats derived from probe telemetry
         results
+
+        % Optional streaming loader — set by ExperimentAnalysis for split-file layout.
+        loaderFcn   = []   % @(k) ana.loadCombo(k)
+        unloaderFcn = []   % @(k) ana.unloadCombo(k)
     end
 
     methods
@@ -98,7 +102,17 @@ classdef SignalStatistics < handle
                 'all',         [obj.raw.calibration, obj.raw.closed, obj.raw.open]);
 
             for c = 1:obj.nCombos
+                % Stream combo on demand if a loader is wired up
+                if ~isempty(obj.loaderFcn)
+                    obj.loaderFcn(c);
+                end
+
                 sr = obj.subject_results(c);
+
+                if isempty(sr.cleanClosed) || isempty(sr.cleanOpen)
+                    fprintf('  [skip] combo %d — signals not loaded\n', c);
+                    continue;
+                end
 
                 % ---- GROUP 1: per-segment stats ----
                 cleanSegs = struct( ...
@@ -127,6 +141,11 @@ classdef SignalStatistics < handle
                 obj.results(c).segment = segStats;
                 obj.results(c).window  = windowStats;
                 obj.results(c).probe   = probeStats;
+
+                % Free combo signals if a loader is managing memory
+                if ~isempty(obj.unloaderFcn)
+                    obj.unloaderFcn(c);
+                end
             end
 
             fprintf('  Done.\n');

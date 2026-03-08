@@ -164,6 +164,12 @@ classdef TemporalAnalysis < handle
         useRobustCov  = true   % use block_geometric_median (EEGLAB) if available
         blockSize     = 10     % blocksize for robust cov (compute_state_covariance_rms)
 
+        % Optional streaming loader — set by ExperimentAnalysis when using
+        % split-file layout.  Signature: loaderFcn(k) loads combo k into
+        % obj.subject_results(k) and unloaderFcn(k) frees it afterward.
+        loaderFcn   = []   % @(k) ana.loadCombo(k)
+        unloaderFcn = []   % @(k) ana.unloadCombo(k)
+
         % Results — 1xN struct array (populated by compute())
         results
 
@@ -294,8 +300,21 @@ classdef TemporalAnalysis < handle
                 fprintf('  V_ref: calibration segment absent — skipping calibrationDrift\n');
             end
 
+            for c = 1:obj.nCombos
+                fprintf('  combo %d/%d\n', c, obj.nCombos);
+
+                % Stream combo on demand if a loader is wired up
+                if ~isempty(obj.loaderFcn)
+                    obj.loaderFcn(c);
+                end
 
                 sr = obj.subject_results(c);
+
+                % Skip combos whose signals were not loaded
+                if isempty(sr.cleanClosed) || isempty(sr.cleanOpen)
+                    fprintf('  [skip] combo %d — signals not loaded\n', c);
+                    continue;
+                end
 
                 cleanMap = struct('closed', double(sr.cleanClosed), ...
                                   'open',   double(sr.cleanOpen));
@@ -542,6 +561,11 @@ classdef TemporalAnalysis < handle
                 obj.results(c).kRank      = kRank;
                 obj.results(c).kRef       = kRef;
                 obj.results(c).channels   = chList;
+
+                % Free combo signals if a loader is managing memory
+                if ~isempty(obj.unloaderFcn)
+                    obj.unloaderFcn(c);
+                end
 
             end % combo loop
 
@@ -996,10 +1020,11 @@ classdef TemporalAnalysis < handle
                 end
 
                 v = double(v(:));
-                out.([f '_mean']) = mean(v, 'omitnan');
-                out.([f '_std'])  = std(v,  'omitnan');
-                out.([f '_max'])  = max(v);
-                out.([f '_p95'])  = prctile(v, 95);
+                vv = v(~isnan(v));   % strip NaNs once — std/max/prctile don't all support 'omitnan'
+                out.([f '_mean']) = mean(v,  'omitnan');
+                out.([f '_std'])  = std(vv);
+                out.([f '_max'])  = max(vv);
+                out.([f '_p95'])  = prctile(vv, 95);
             end
         end
 

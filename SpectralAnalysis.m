@@ -10,12 +10,19 @@ classdef SpectralAnalysis < handle
     %     helperASR_metrics_spectralAnalysis → called per segment inside compute()
     %     helperASR_metrics_spectralSummary  → results(k).summary.(segment)
     %
-    %   ── PSD details (identical to helpers) ──────────────────────────────
-    %   Welch PSD via pwelch(signal, [], [], 0:0.5:fs/2, fs).
+    %   ── PSD details ─────────────────────────────────────────────────────
+    %   Welch PSD via pwelch(signal, window, noverlap, 0:freqResolution:fs/2, fs).
     %   Total power  = trapz(f, Pxx).
     %   Band power   = trapz over band-frequency indices.
     %   Relative power = bandPower / totalPower  (no eps guard — matches helper).
-    %   Frequency resolution: 0.5 Hz (hard-coded in helpers, exposed as property here).
+    %
+    %   Configurable Welch parameters (set before compute(), or pass to compute()):
+    %     welchWinSec   : window length in seconds   (default [] → MATLAB default)
+    %     welchOverlap  : overlap fraction 0–<1       (default [] → MATLAB default)
+    %     freqResolution: frequency axis step in Hz   (default 0.5 Hz)
+    %
+    %   Legacy default (welchWinSec=[], welchOverlap=[]) passes [] to pwelch for both
+    %   window and noverlap, which is identical to the original helper behaviour.
     %
     %   ── Band definitions (from helperASR_metrics_spectralAnalysis) ──────
     %     delta  [1  4] Hz
@@ -78,8 +85,10 @@ classdef SpectralAnalysis < handle
         algorithmName     % For display / titles only
         nCombos
 
-        % PSD / band config — may be overridden before compute()
-        freqResolution = 0.5   % Hz — matches helper hard-code
+        % PSD / band config — may be overridden before compute(), or via compute() args
+        freqResolution = 0.5   % Hz — frequency axis step for pwelch nfft argument
+        welchWinSec    = []    % Welch window length (sec); [] = MATLAB default (~8× 1/freqRes)
+        welchOverlap   = []    % Welch overlap fraction 0–<1; [] = MATLAB default (50%)
 
         bands = struct( ...    % Hz — matches helperASR_metrics_spectralAnalysis
             'delta', [1  4],  ...
@@ -90,6 +99,10 @@ classdef SpectralAnalysis < handle
 
         % Segments to analyse
         segments = {'closed', 'open', 'all'}
+
+        % Optional streaming loader — set by ExperimentAnalysis for split-file layout.
+        loaderFcn   = []   % @(k) ana.loadCombo(k)
+        unloaderFcn = []   % @(k) ana.unloadCombo(k)
 
         % Results — 1xN struct array (populated by compute())
         results
@@ -122,8 +135,45 @@ classdef SpectralAnalysis < handle
         end
 
         % ── compute ──────────────────────────────────────────────────
-        function compute(obj)
+        function compute(obj, varargin)
             % COMPUTE - Run spectral analysis across all combos and segments.
+            %
+            %   Optional name-value options (override properties for this run):
+            %     'welchWinSec'    scalar > 0   Welch window length (sec)
+            %                                   [] = MATLAB default  (default [])
+            %     'welchOverlap'   0 ≤ x < 1    Overlap fraction
+            %                                   [] = MATLAB default 50%  (default [])
+            %     'freqResolution' scalar > 0   Frequency axis step Hz  (default 0.5)
+            %
+            %   Example:
+            %     sp.compute();                               % legacy defaults
+            %     sp.compute('welchWinSec', 2, 'welchOverlap', 0.5);
+            %     sp.compute('welchWinSec', 4);               % 4-sec Hann window
+
+            p = inputParser;
+            addParameter(p, 'welchWinSec',    obj.welchWinSec,    ...
+                @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x > 0));
+            addParameter(p, 'welchOverlap',   obj.welchOverlap,   ...
+                @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x >= 0 && x < 1));
+            addParameter(p, 'freqResolution', obj.freqResolution, ...
+                @(x) isnumeric(x) && isscalar(x) && x > 0);
+            parse(p, varargin{:});
+
+            obj.welchWinSec    = p.Results.welchWinSec;
+            obj.welchOverlap   = p.Results.welchOverlap;
+            obj.freqResolution = p.Results.freqResolution;
+
+            % Resolve window / noverlap in samples once (shared by all pwelch calls)
+            if isempty(obj.welchWinSec)
+                welchWin = [];      % MATLAB default
+            else
+                welchWin = round(obj.welchWinSec * obj.fs);
+            end
+            if isempty(obj.welchOverlap) || isempty(welchWin)
+                welchNov = [];      % MATLAB default (also safe if no explicit window)
+            else
+                welchNov = round(obj.welchOverlap * welchWin);
+            end
 
             fprintf('SpectralAnalysis: S%d %s (%d combo(s))...\n', ...
                 obj.subjectID, obj.algorithmName, obj.nCombos);
@@ -135,7 +185,17 @@ classdef SpectralAnalysis < handle
                 'all',    double([obj.raw.calibration, obj.raw.closed, obj.raw.open]));
 
             for c = 1:obj.nCombos
+                % Stream combo on demand if a loader is wired up
+                if ~isempty(obj.loaderFcn)
+                    obj.loaderFcn(c);
+                end
+
                 sr = obj.subject_results(c);
+
+                if isempty(sr.cleanClosed) || isempty(sr.cleanOpen)
+                    fprintf('  [skip] combo %d — signals not loaded\n', c);
+                    continue;
+                end
 
                 cleanMap = struct( ...
                     'closed', double(sr.cleanClosed), ...
@@ -159,15 +219,15 @@ classdef SpectralAnalysis < handle
 
                     % helperASR_metrics_spectralAnalysis equivalent:
                     %   .before = bandPower(original)   .after = bandPower(cleaned)
-                    raw_m   = SpectralAnalysis.bandPower(Xr, obj.fs, obj.bands, obj.freqResolution);
-                    clean_m = SpectralAnalysis.bandPower(Xc, obj.fs, obj.bands, obj.freqResolution);
+                    raw_m   = SpectralAnalysis.bandPower(Xr, obj.fs, obj.bands, obj.freqResolution, welchWin, welchNov);
+                    clean_m = SpectralAnalysis.bandPower(Xc, obj.fs, obj.bands, obj.freqResolution, welchWin, welchNov);
 
                     perCh.(seg).raw   = raw_m;
                     perCh.(seg).clean = clean_m;
 
                     % Mean PSD — needed for spectralCorr / spectralKL and plots
-                    [psd_raw_mean,   f] = SpectralAnalysis.meanPSD(Xr, obj.fs, obj.freqResolution);
-                    [psd_clean_mean, ~] = SpectralAnalysis.meanPSD(Xc, obj.fs, obj.freqResolution);
+                    [psd_raw_mean,   f] = SpectralAnalysis.meanPSD(Xr, obj.fs, obj.freqResolution, welchWin, welchNov);
+                    [psd_clean_mean, ~] = SpectralAnalysis.meanPSD(Xc, obj.fs, obj.freqResolution, welchWin, welchNov);
 
                     psdOut.(seg).raw_mean   = psd_raw_mean;
                     psdOut.(seg).clean_mean = psd_clean_mean;
@@ -181,6 +241,13 @@ classdef SpectralAnalysis < handle
                 obj.results(c).summary    = summ;
                 obj.results(c).psd        = psdOut;
                 obj.results(c).parameters = sr.parameters;
+
+                fprintf('  combo %d/%d done.\n', c, obj.nCombos);
+
+                % Free combo signals if a loader is managing memory
+                if ~isempty(obj.unloaderFcn)
+                    obj.unloaderFcn(c);
+                end
             end
 
             fprintf('  Done.\n');
@@ -495,15 +562,25 @@ classdef SpectralAnalysis < handle
     % ================================================================
     methods (Static, Access = private)
 
-        function metrics = bandPower(eeg, fs, bands, freqRes)
+        function metrics = bandPower(eeg, fs, bands, freqRes, welchWin, welchNov)
             % BANDPOWER - Faithful replica of helperASR_metrics_bandPower.
             %
             %   Exact match to helper implementation:
-            %     pwelch(eeg(ch,:), [], [], 0:fRes:fs/2, fs)  — row-vector freq axis
-            %     relativePower = bandPow / totalPower         — no eps guard
+            %     pwelch(eeg(ch,:), welchWin, welchNov, 0:fRes:fs/2, fs)
+            %     relativePower = bandPow / totalPower   — no eps guard
             %     metrics.bandPower.(band)(ch,1) column assignment
+            %
+            %   Args:
+            %     eeg       : [C x T] double
+            %     fs        : sampling rate Hz
+            %     bands     : struct of [lo hi] Hz band definitions
+            %     freqRes   : frequency axis step Hz (default 0.5)
+            %     welchWin  : pwelch window in samples  ([] = MATLAB default)
+            %     welchNov  : pwelch noverlap in samples ([] = MATLAB default)
 
-            if nargin < 4, freqRes = 0.5; end
+            if nargin < 4, freqRes  = 0.5; end
+            if nargin < 5, welchWin = [];  end
+            if nargin < 6, welchNov = [];  end
 
             [nCh, ~]  = size(eeg);
             bandNames = fieldnames(bands);
@@ -515,8 +592,7 @@ classdef SpectralAnalysis < handle
             end
 
             for ch = 1:nCh
-                % Row-vector nfft argument — matches helper: 0:fRes:fs/2
-                [Pxx, f] = pwelch(double(eeg(ch, :)), [], [], 0:freqRes:fs/2, fs);
+                [Pxx, f] = pwelch(double(eeg(ch, :)), welchWin, welchNov, 0:freqRes:fs/2, fs);
 
                 totalPower        = trapz(f, Pxx);
                 metrics.total(ch) = totalPower;
@@ -527,23 +603,32 @@ classdef SpectralAnalysis < handle
                     bPow = trapz(f(idx), Pxx(idx));
 
                     metrics.bandPower.(b)(ch, 1)     = bPow;
-                    % Exact match to helper: / totalPower, no eps guard
                     metrics.relativePower.(b)(ch, 1) = bPow / totalPower;
                 end
             end
         end
 
-        function [psd_mean, f] = meanPSD(eeg, fs, freqRes)
+        function [psd_mean, f] = meanPSD(eeg, fs, freqRes, welchWin, welchNov)
             % MEANPSD - Channel-mean Welch PSD (for spectralCorr/KL and plotting).
             %   Uses identical pwelch call to bandPower.
-            if nargin < 3, freqRes = 0.5; end
+            %
+            %   Args:
+            %     eeg      : [C x T] double
+            %     fs       : sampling rate Hz
+            %     freqRes  : frequency axis step Hz (default 0.5)
+            %     welchWin : pwelch window in samples  ([] = MATLAB default)
+            %     welchNov : pwelch noverlap in samples ([] = MATLAB default)
+
+            if nargin < 3, freqRes  = 0.5; end
+            if nargin < 4, welchWin = [];  end
+            if nargin < 5, welchNov = [];  end
 
             [nCh, ~] = size(eeg);
             psd_sum  = [];
             f        = [];
 
             for ch = 1:nCh
-                [Pxx, fOut] = pwelch(double(eeg(ch, :)), [], [], 0:freqRes:fs/2, fs);
+                [Pxx, fOut] = pwelch(double(eeg(ch, :)), welchWin, welchNov, 0:freqRes:fs/2, fs);
                 if isempty(psd_sum)
                     psd_sum = zeros(size(Pxx));
                     f       = fOut;
