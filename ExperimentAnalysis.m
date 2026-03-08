@@ -20,7 +20,8 @@ classdef ExperimentAnalysis < handle
     %       ana = ExperimentAnalysis.fromOutputResults(data, asrObj, 'vanilla-asr', 500);
     %
     %   MEMORY MODE — from pre-loaded data structs:
-    %       ana = ExperimentAnalysis.fromData(raw, subject_results, 'vanilla-asr', 3, 500);
+    %       ana = ExperimentAnalysis.fromData(raw, subject_results, 'vanilla-asr');
+    %       ana = ExperimentAnalysis.fromData(raw, subject_results, 'vanilla-asr', 500, 3);
     %
     %   RUNNING METRICS:
     %       ana.computeBlinks();              % delegates to BlinkAnalysis
@@ -599,21 +600,24 @@ classdef ExperimentAnalysis < handle
             fprintf('Loaded (memory) %s -- ready.\n', algorithmName);
         end
 
-        function obj = fromData(raw, subject_results, algorithmName, subjectID, fs)
+        function obj = fromData(raw, subject_results, algorithmName, fs, subjectID)
             % FROMDATA - Memory mode: construct directly from pre-loaded data.
             %
-            %   obj = ExperimentAnalysis.fromData(raw, subject_results, ...
-            %               algorithmName, subjectID, fs)
+            %   obj = ExperimentAnalysis.fromData(raw, subject_results, algorithmName)
+            %   obj = ExperimentAnalysis.fromData(raw, subject_results, algorithmName, fs)
+            %   obj = ExperimentAnalysis.fromData(raw, subject_results, algorithmName, fs, subjectID)
             %
             %   Inputs:
-            %     raw            - struct with fields .calibration, .closed, .open [C x T]
+            %     raw             - struct with fields .calibration, .closed, .open [C x T]
             %     subject_results - 1xN struct array of per-combo results
-            %     algorithmName  - char, e.g. 'vanilla-asr'
-            %     subjectID      - numeric subject identifier
-            %     fs             - sampling frequency (Hz)
+            %     algorithmName   - char, e.g. 'vanilla-asr'
+            %     fs              - sampling frequency in Hz (default: 500)
+            %     subjectID       - numeric subject identifier (default: 0)
             %
             %   This factory bypasses all file I/O. Useful when data is already
             %   in memory (e.g. from a batch view or external loader).
+            if nargin < 5 || isempty(subjectID), subjectID = 0;   end
+            if nargin < 4 || isempty(fs),        fs        = 500; end
             obj                   = ExperimentAnalysis(tempdir(), algorithmName, subjectID, fs);
             obj.mode              = 'memory';
             obj.raw               = raw;
