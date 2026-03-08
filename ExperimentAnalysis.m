@@ -19,6 +19,9 @@ classdef ExperimentAnalysis < handle
     %       [data, asrObj] = experiment.outputResults();
     %       ana = ExperimentAnalysis.fromOutputResults(data, asrObj, 'vanilla-asr', 500);
     %
+    %   MEMORY MODE — from pre-loaded data structs:
+    %       ana = ExperimentAnalysis.fromData(raw, subject_results, 'vanilla-asr', 3, 500);
+    %
     %   RUNNING METRICS:
     %       ana.computeBlinks();              % delegates to BlinkAnalysis
     %       % future: ana.computeBandPower();
@@ -594,6 +597,28 @@ classdef ExperimentAnalysis < handle
             obj.nCombos         = 1;
 
             fprintf('Loaded (memory) %s -- ready.\n', algorithmName);
+        end
+
+        function obj = fromData(raw, subject_results, algorithmName, subjectID, fs)
+            % FROMDATA - Memory mode: construct directly from pre-loaded data.
+            %
+            %   obj = ExperimentAnalysis.fromData(raw, subject_results, ...
+            %               algorithmName, subjectID, fs)
+            %
+            %   Inputs:
+            %     raw            - struct with fields .calibration, .closed, .open [C x T]
+            %     subject_results - 1xN struct array of per-combo results
+            %     algorithmName  - char, e.g. 'vanilla-asr'
+            %     subjectID      - numeric subject identifier
+            %     fs             - sampling frequency (Hz)
+            %
+            %   This factory bypasses all file I/O. Useful when data is already
+            %   in memory (e.g. from a batch view or external loader).
+            obj                   = ExperimentAnalysis(tempdir(), algorithmName, subjectID, fs);
+            obj.mode              = 'memory';
+            obj.raw               = raw;
+            obj.subject_results   = subject_results;
+            obj.nCombos           = numel(subject_results);
         end
 
     end % static methods
